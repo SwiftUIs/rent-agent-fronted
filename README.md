@@ -185,6 +185,7 @@ npm run lint     # 运行代码检查
 - API 文档：[`api_documentation.md`](api_documentation.md)
 - GitHub 仓库：[SwiftUIs/rent-agent-fronted](https://github.com/SwiftUIs/rent-agent-fronted)
 - 作者后端架构文章：[从零开始：前端转型 AI agent 直到就业第十八天-第五十六天](https://juejin.cn/post/7644135664519741449)
+- FastAPI 后端代码：[backend/README.md](backend/README.md)
 
 > 注：仓库名称中的 `fronted` 看起来是 `frontend` 的拼写变体；本文沿用仓库当前名称，以保持与 GitHub 地址一致。
 
