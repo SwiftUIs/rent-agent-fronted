@@ -58,6 +58,75 @@ RentAgent.AI 是一个面向澳洲租房场景的 **AI Agent 房源智能检索�
 
 因此，仅启动前端并不会自动提供完整的 AI 查询能力；必须确保前端配置的后端 API 服务可访问。
 
+## 后端架构
+
+根据作者对项目后端的介绍，RentAgent.AI 的后端不是普通的房源 CRUD 服务，而是一个面向结构化数据查询的 **Text-to-SQL Agent**。整体链路可以概括为：
+
+```text
+浏览器前端
+    │ HTTPS + REST / SSE
+    ▼
+FastAPI API 服务
+    │
+    ├── QueryService
+    │       └── LangGraph Agent 状态图
+    │              ├── 关键词抽取
+    │              ├── 元数据召回
+    │              ├── 指标/字段/值过滤
+    │              ├── SQL 生成
+    │              ├── SQL 验证
+    │              ├── SQL 校正与重试
+    │              └── 只读 SQL 执行
+    │
+    ├── 元知识检索服务
+    │       ├── Elasticsearch：关键词检索
+    │       └── Qdrant：向量语义检索
+    │
+    ├── LLM / Embedding 服务
+    │       ├── DeepSeek / GPT / Claude
+    │       └── TEI + bge-large-zh-v1.5
+    │
+    └── MySQL 数据层
+            ├── dw：房源业务数据
+            └── meta_db：表结构、字段和指标定义
+```
+
+作者文章明确提到的后端技术包括 **Python 3.12+、FastAPI、LangGraph、MySQL 8.0、Elasticsearch、Qdrant、bge-large-zh-v1.5、HuggingFace TEI 和 `uv`**。其中，FastAPI 负责 API 接入，LangGraph 负责有状态的 Agent 节点编排，TEI 提供私有化 Embedding 接口，Elasticsearch 和 Qdrant 共同完成元数据混合检索。[作者文章](https://juejin.cn/post/7644135664519741449)
+
+`/api/query` 使用 SSE 流式返回 Agent 节点进度、最终结果或错误事件，因此后端需要保持查询期间的长连接，并在每个节点完成时推送 `progress` 事件。SQL 验证失败时，LangGraph 可以将状态转交给 SQL 校正节点，再重新执行查询；这也是该项目区别于普通问答接口的关键能力。
+
+## 数据库架构
+
+后端采用“**MySQL 双逻辑库 + Elasticsearch/Qdrant 派生索引**”的思路。`dw` 是房源业务数据仓库，保存房源事实数据；`meta_db` 保存 Agent 用来理解数据库的元知识，例如表结构、字段描述、业务指标、枚举值和允许的关联关系。
+
+| 数据组件 | 主要职责 | 数据性质 |
+| :--- | :--- | :--- |
+| MySQL `dw` | 房源主数据、地区、租金和可租状态 | 权威事实数据 |
+| MySQL `meta_db` | 表、列、指标、枚举值、JOIN 关系和 Prompt 元数据 | Agent 元知识 |
+| Elasticsearch | 城市、房型、字段名、别名和值的关键词匹配 | 可重建的倒排索引 |
+| Qdrant | 字段描述、指标定义和自然语言表达的语义匹配 | 可重建的向量索引 |
+| Token 审计表 | 请求 ID、节点、模型、输入/输出 Token、估算成本和时间 | 查询审计数据 |
+
+房源核心数据至少包括 `product_id`、`product_name`、`property_type`、`bedrooms`、`bathrooms`、`price`、`is_pet_friendly` 和 `region_name`。推荐将房源主表、地区表、查询请求表和 LLM Token 使用表放在 `dw` 中；将 `meta_table`、`meta_column`、`meta_metric`、`meta_enum_value` 和 `meta_relation` 等元数据表放在 `meta_db` 中。
+
+Elasticsearch 和 Qdrant 不应作为唯一事实源。新增房源时，建议先通过 MySQL 事务写入 `dw`，再发布索引同步事件，后台任务负责更新 Elasticsearch、生成 Embedding 并写入 Qdrant。这样可以让 MySQL 作为权威源，让检索索引采用最终一致性，并通过重试或定时对账修复同步失败。
+
+## Text-to-SQL 安全要求
+
+由于后端会执行大模型生成的 SQL，生产环境不能只依赖 Prompt 约束。建议同时使用只读数据库账号、SQL AST 解析、表字段白名单、强制 `LIMIT`、查询超时、最大返回行数、JOIN 白名单和完整审计日志。SQL 校正也应设置最大重试次数，避免异常情况下无限循环。
+
+当前 Vercel 配置将 `/api/*` 转发到 `http://175.178.18.199:8000`，这适合 Demo 联调，但正式环境建议替换成 HTTPS 域名或 API Gateway，并补充鉴权、限流、来源校验和密钥管理。数据库凭据与 LLM API Key 不应出现在前端代码或浏览器请求中。
+
+## 后端实现方案选择
+
+| 方案 | 架构 | 优点 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| 保持当前设计 | MySQL `dw` + MySQL `meta_db` + Elasticsearch + Qdrant | 与作者文章和现有 API 最一致，适合展示混合检索原理 | 复现项目、学习 Agent/RAG 架构 |
+| 生产简化版 | PostgreSQL + pgvector + Redis | 组件更少，结构化数据与向量检索更容易统一 | 中小规模生产 MVP |
+| 扩展分析版 | MySQL + ClickHouse + Elasticsearch/Qdrant | 适合大量历史房源和复杂统计分析 | 数据规模明显增长后 |
+
+如果目标是复现作者项目，建议继续采用第一种方案；如果目标是重新建设一个更易运维的生产 MVP，可以评估 PostgreSQL + pgvector。当前项目规模下，不建议一开始就同时引入过多基础设施。
+
 ## API 接口概览
 
 完整接口定义请参阅 [`api_documentation.md`](api_documentation.md)。当前前端使用的主要接口如下：
@@ -115,6 +184,7 @@ npm run lint     # 运行代码检查
 - 在线演示：[rent-agent-fronted.vercel.app](https://rent-agent-fronted.vercel.app/)
 - API 文档：[`api_documentation.md`](api_documentation.md)
 - GitHub 仓库：[SwiftUIs/rent-agent-fronted](https://github.com/SwiftUIs/rent-agent-fronted)
+- 作者后端架构文章：[从零开始：前端转型 AI agent 直到就业第十八天-第五十六天](https://juejin.cn/post/7644135664519741449)
 
 > 注：仓库名称中的 `fronted` 看起来是 `frontend` 的拼写变体；本文沿用仓库当前名称，以保持与 GitHub 地址一致。
 
